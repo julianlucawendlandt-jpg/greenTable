@@ -2,13 +2,18 @@
 UTR-LM comparison experiment runner.
 
 Runs three controlled conditions on every benchmark so you can directly
-compare the architectural choices:
+compare the architectural choices.
+
+Backbone is identical for all three: model_dim=128, num_layers=6, reduced_dim=16.
+Only bpp_backend and aux_struct differ, keeping the comparison strictly controlled.
 
   A) seq_only   bpp=zero  aux_struct=False   Sequence-only baseline
                                              (no structure anywhere)
 
   B) utrlm      bpp=zero  aux_struct=True    Sequence input + SS/MFE targets
                                              ← mirrors what UTR-LM does
+                                             lambda_ss=0.05, lambda_mfe=0.001
+                                             epochs>=120, patience>=15
 
   C) plucker    bpp=mfe   aux_struct=False   Structure-as-graph-input (your model)
                                              ← no auxiliary supervision
@@ -81,11 +86,21 @@ BPP_CACHE_DIR = os.path.expanduser('~/bpp_cache')
 
 # Each condition is a letter (A/B/C), a short label, and the relevant flags.
 # The comparison table is keyed by these labels.
+#
+# Backbone is identical across all three: model_dim=128, num_layers=6, reduced_dim=16
+# Only bpp_backend and aux_struct vary, keeping the comparison strictly controlled.
+#
+# Condition B training overrides:
+#   lambda_ss/mfe are smaller so aux heads don't swamp the primary MRL signal.
+#   min_epochs=120 gives extra room since multitask convergence is slower; early
+#   stopping will cut it short if the model plateaus before that.
 CONDITIONS = {
     'A': dict(label='seq_only', bpp='zero', aux_struct=False,
               description='Sequence-only baseline (no structure, no aux)'),
     'B': dict(label='utrlm',   bpp='zero', aux_struct=True,
-              description='UTR-LM style: seq input + SS/MFE targets, bpp=zero'),
+              description='UTR-LM style: seq input + SS/MFE targets, bpp=zero',
+              lambda_ss=0.05, lambda_mfe=0.001,
+              min_epochs=120, min_patience=15),
     'C': dict(label='plucker', bpp='mfe',  aux_struct=False,
               description='Your model: structure-as-graph-input, no aux targets'),
 }
@@ -103,13 +118,13 @@ class Experiment:
     folds:       int            = 1
     bpp:         str            = 'mfe'
     aux_struct:  bool           = False
-    lambda_ss:   float          = 0.1
-    lambda_mfe:  float          = 0.01
+    lambda_ss:   float          = 0.05
+    lambda_mfe:  float          = 0.001
     epochs:      int            = 100
     patience:    int            = 15
     model_dim:   int            = 128
-    num_layers:  int            = 4
-    reduced_dim: int            = 32
+    num_layers:  int            = 6
+    reduced_dim: int            = 16
     dropout:     float          = 0.1
 
 
@@ -132,6 +147,9 @@ def _triplet(
     exps = []
     for cond_key in conditions:
         cond = CONDITIONS[cond_key]
+        # Apply per-condition epoch/patience floors (condition B needs more room)
+        cond_epochs  = max(epochs,   cond.get('min_epochs',   0))
+        cond_patience = max(patience, cond.get('min_patience', 0))
         exps.append(Experiment(
             name       = f'{benchmark}_{cond["label"]}',
             task       = task,
@@ -142,8 +160,10 @@ def _triplet(
             folds      = actual_folds,
             bpp        = cond['bpp'],
             aux_struct = cond['aux_struct'],
-            epochs     = epochs,
-            patience   = patience,
+            lambda_ss  = cond.get('lambda_ss',  0.05),
+            lambda_mfe = cond.get('lambda_mfe', 0.001),
+            epochs     = cond_epochs,
+            patience   = cond_patience,
             dropout    = dropout,
         ))
     return exps
@@ -377,12 +397,18 @@ def print_comparison_table(
     """
     Print a side-by-side comparison of all three conditions per benchmark.
 
-    Primary metric is chosen per task:
-        mrl / rlu  -> spearman_r
+    Metrics shown per task:
+        mrl        -> spearman_r  AND  pearson_r  (two rows)
         te / el    -> spearman_r
+        rlu        -> pearson_r
     """
-    TASK_METRIC = {'mrl': 'spearman_r', 'te': 'spearman_r',
-                   'el': 'spearman_r',  'rlu': 'pearson_r'}
+    # List of (metric_key, label) tuples per task
+    TASK_METRICS = {
+        'mrl': [('spearman_r', 'spearman'), ('pearson_r', 'pearson')],
+        'te':  [('spearman_r', 'spearman')],
+        'el':  [('spearman_r', 'spearman')],
+        'rlu': [('pearson_r',  'pearson')],
+    }
 
     # Collect unique benchmarks in insertion order
     seen = {}
@@ -394,7 +420,8 @@ def print_comparison_table(
     cond_labels = [CONDITIONS[k]['label'] for k in sorted(CONDITIONS)]
 
     print('\n' + '=' * 72)
-    print('  COMPARISON SUMMARY  (primary metric per benchmark)')
+    print('  COMPARISON SUMMARY')
+    print('  Backbone: model_dim=128  num_layers=6  reduced_dim=16 (same for A/B/C)')
     print('  Conditions:')
     for k, v in sorted(CONDITIONS.items()):
         print(f'    {k} [{v["label"]:<10}] {v["description"]}')
@@ -405,18 +432,20 @@ def print_comparison_table(
     print('  ' + '-' * (32 + col_w * len(cond_labels)))
 
     for bench, task in benchmarks:
-        metric_key = TASK_METRIC.get(task, 'spearman_r')
-        row = f'  {bench + " (" + metric_key + ")":<32}'
-        for k in sorted(CONDITIONS):
-            exp_name = f'{bench}_{CONDITIONS[k]["label"]}'
-            res = all_results.get(exp_name)
-            if res is None:
-                val = 'n/a'
-            else:
-                v = res.get(metric_key)
-                val = f'{v:.4f}' if v is not None else '---'
-            row += f'{val:>{col_w}}'
-        print(row)
+        metrics_list = TASK_METRICS.get(task, [('spearman_r', 'spearman')])
+        for metric_key, metric_label in metrics_list:
+            row_label = f'{bench} ({metric_label})'
+            row = f'  {row_label:<32}'
+            for k in sorted(CONDITIONS):
+                exp_name = f'{bench}_{CONDITIONS[k]["label"]}'
+                res = all_results.get(exp_name)
+                if res is None:
+                    val = 'n/a'
+                else:
+                    v = res.get(metric_key)
+                    val = f'{v:.4f}' if v is not None else '---'
+                row += f'{val:>{col_w}}'
+            print(row)
 
     print('\n  ' + '-' * (32 + col_w * len(cond_labels)))
     print('  Elapsed times (min):')
