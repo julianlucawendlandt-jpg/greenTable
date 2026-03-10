@@ -326,7 +326,7 @@ def run_pretrain(cfg: PretrainConfig):
     )
     total_steps = cfg.epochs * len(train_loader)
     sched  = WarmupCosineScheduler(opt, cfg.warmup_steps, total_steps)
-    scaler = torch.amp.GradScaler('cuda') if amp_ok else None
+    scaler = torch.cuda.amp.GradScaler() if amp_ok else None
 
     best_val_loss   = np.inf
     best_epoch      = 0
