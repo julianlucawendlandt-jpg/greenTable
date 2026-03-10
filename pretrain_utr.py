@@ -64,7 +64,7 @@ class PretrainConfig:
     # 'zero' = UTR-LM style: no structural edges as input; structure is only
     # a supervision signal (SS/MFE targets).  Use 'mfe' if you want structure
     # to also flow in as graph edges during pretraining (different regime).
-    bpp_cache_dir: str   = 'bpp_cache'
+    bpp_cache_dir: str   = '~/bpp_cache'
     max_len:       int   = 256
     mlm_prob:      float = 0.15
     aux_struct:    bool  = True         # add SS + MFE objectives
@@ -127,7 +127,7 @@ def _parse_sources(source_strs: List[str]) -> List[Tuple[str, str]]:
 # ─── Dataset & model builders ─────────────────────────────────────────────────
 
 def build_pretrain_dataset(cfg: PretrainConfig) -> PretrainDataset:
-    cache    = BPPCache(cfg.bpp_cache_dir, backend=cfg.bpp_backend)
+    cache    = BPPCache(os.path.expanduser(cfg.bpp_cache_dir), backend=cfg.bpp_backend)
     sources  = _parse_sources(cfg.sources)
     excludes = _parse_sources(cfg.exclude_sources) if cfg.exclude_sources else None
     top_k    = 0 if cfg.bpp_backend == 'zero' else 4
@@ -441,7 +441,7 @@ def parse_args() -> PretrainConfig:
                    help="'zero' (default) = UTR-LM style: no structural graph edges; "
                         "structure only as SS/MFE supervision targets. "
                         "'mfe'/'viennarna' = structure also flows in as graph edges.")
-    p.add_argument('--bpp_cache_dir', default='bpp_cache')
+    p.add_argument('--bpp_cache_dir', default='~/bpp_cache')
     p.add_argument('--max_len',       type=int, default=256)
     p.add_argument('--mlm_prob',      type=float, default=0.15,
                    help='Fraction of tokens masked for MLM')
