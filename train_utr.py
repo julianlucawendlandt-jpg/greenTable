@@ -62,7 +62,7 @@ class TrainConfig:
     task:         str   = 'mrl'        # mrl | te | el | ires | rlu
     data:         str   = ''           # path to CSV
     bpp_backend:  str   = 'mfe'        # viennarna | mfe | zero
-    bpp_cache_dir:str   = 'bpp_cache'
+    bpp_cache_dir:str   = '~/bpp_cache'
     seq_col:      Optional[str] = None # None → auto from task (see _auto_fill)
     label_col:    Optional[str] = None # None → auto from task
     lib_col:      Optional[str] = None # column with library name (MRL)
@@ -141,7 +141,7 @@ def _auto_fill(cfg: TrainConfig) -> TrainConfig:
 
 def build_dataset(cfg: TrainConfig):
     """Instantiate the right dataset class for the given task."""
-    cache = BPPCache(cfg.bpp_cache_dir, backend=cfg.bpp_backend)
+    cache = BPPCache(os.path.expanduser(cfg.bpp_cache_dir), backend=cfg.bpp_backend)
     common = dict(
         bpp_cache=cache,
         top_k_struct=0 if cfg.bpp_backend == 'zero' else 4,
@@ -641,7 +641,7 @@ def parse_args() -> TrainConfig:
                    choices=['viennarna', 'mfe', 'zero'],
                    help='Structure computation: viennarna (slow/accurate), '
                         'mfe (fast/binary), zero (ablation — local edges only)')
-    p.add_argument('--bpp_cache_dir',default='bpp_cache')
+    p.add_argument('--bpp_cache_dir',default='~/bpp_cache')
     p.add_argument('--seq_col',      default=None,
                    help='Sequence column name (default: auto per task)')
     p.add_argument('--label_col',    default=None,
