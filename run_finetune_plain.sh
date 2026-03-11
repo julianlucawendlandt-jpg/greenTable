@@ -44,7 +44,7 @@ for KEY in "${!MRL_PAIRS[@]}"; do
     --folds           1 \
     --val_frac        0.2 \
     --seed            42 \
-    --eval_every      5 \
+    --eval_every      1 \
     --num_workers     4 \
     --pretrained_backbone "$BACKBONE" \
     --output_dir      finetune_plain/mrl_${KEY}
@@ -72,7 +72,7 @@ for CELL in HEK Muscle pc3; do
     --folds           5 \
     --val_frac        0.2 \
     --seed            42 \
-    --eval_every      5 \
+    --eval_every      1 \
     --num_workers     4 \
     --pretrained_backbone "$BACKBONE" \
     --output_dir      finetune_plain/te_${CELL}
@@ -99,7 +99,7 @@ python train_utr.py \
   --folds           1 \
   --val_frac        0.2 \
   --seed            42 \
-  --eval_every      5 \
+  --eval_every      1 \
   --num_workers     4 \
   --pretrained_backbone "$BACKBONE" \
   --output_dir      finetune_plain/rlu

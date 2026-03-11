@@ -39,7 +39,7 @@ python train_utr.py \
   --folds           1 \
   --val_frac        0.2 \
   --seed            42 \
-  --eval_every      5 \
+  --eval_every      1 \
   --num_workers     4 \
   --pretrained_backbone "$BACKBONE" \
   --output_dir      finetune_aux/mrl_4.1
@@ -68,7 +68,7 @@ python train_utr.py \
   --folds           1 \
   --val_frac        0.2 \
   --seed            42 \
-  --eval_every      5 \
+  --eval_every      1 \
   --num_workers     4 \
   --pretrained_backbone "$BACKBONE" \
   --output_dir      finetune_aux/mrl_4.4
@@ -97,7 +97,7 @@ python train_utr.py \
   --folds           1 \
   --val_frac        0.2 \
   --seed            42 \
-  --eval_every      5 \
+  --eval_every      1 \
   --num_workers     4 \
   --pretrained_backbone "$BACKBONE" \
   --output_dir      finetune_aux/mrl_4.7
@@ -126,7 +126,7 @@ python train_utr.py \
   --folds           1 \
   --val_frac        0.2 \
   --seed            42 \
-  --eval_every      5 \
+  --eval_every      1 \
   --num_workers     4 \
   --pretrained_backbone "$BACKBONE" \
   --output_dir      finetune_aux/mrl_4.10
@@ -155,7 +155,7 @@ python train_utr.py \
   --folds           1 \
   --val_frac        0.2 \
   --seed            42 \
-  --eval_every      5 \
+  --eval_every      1 \
   --num_workers     4 \
   --pretrained_backbone "$BACKBONE" \
   --output_dir      finetune_aux/mrl_4.13
@@ -184,7 +184,7 @@ python train_utr.py \
   --folds           1 \
   --val_frac        0.2 \
   --seed            42 \
-  --eval_every      5 \
+  --eval_every      1 \
   --num_workers     4 \
   --pretrained_backbone "$BACKBONE" \
   --output_dir      finetune_aux/mrl_4.16
@@ -213,7 +213,7 @@ python train_utr.py \
   --folds           1 \
   --val_frac        0.2 \
   --seed            42 \
-  --eval_every      5 \
+  --eval_every      1 \
   --num_workers     4 \
   --pretrained_backbone "$BACKBONE" \
   --output_dir      finetune_aux/mrl_4.19
@@ -242,7 +242,7 @@ python train_utr.py \
   --folds           1 \
   --val_frac        0.2 \
   --seed            42 \
-  --eval_every      5 \
+  --eval_every      1 \
   --num_workers     4 \
   --pretrained_backbone "$BACKBONE" \
   --output_dir      finetune_aux/mrl_4.22
@@ -272,7 +272,7 @@ python train_utr.py \
   --folds           5 \
   --val_frac        0.2 \
   --seed            42 \
-  --eval_every      5 \
+  --eval_every      1 \
   --num_workers     4 \
   --pretrained_backbone "$BACKBONE" \
   --output_dir      finetune_aux/te_HEK
@@ -300,7 +300,7 @@ python train_utr.py \
   --folds           5 \
   --val_frac        0.2 \
   --seed            42 \
-  --eval_every      5 \
+  --eval_every      1 \
   --num_workers     4 \
   --pretrained_backbone "$BACKBONE" \
   --output_dir      finetune_aux/te_Muscle
@@ -328,7 +328,7 @@ python train_utr.py \
   --folds           5 \
   --val_frac        0.2 \
   --seed            42 \
-  --eval_every      5 \
+  --eval_every      1 \
   --num_workers     4 \
   --pretrained_backbone "$BACKBONE" \
   --output_dir      finetune_aux/te_pc3
@@ -358,7 +358,7 @@ python train_utr.py \
   --folds           1 \
   --val_frac        0.2 \
   --seed            42 \
-  --eval_every      5 \
+  --eval_every      1 \
   --num_workers     4 \
   --pretrained_backbone "$BACKBONE" \
   --output_dir      finetune_aux/rlu
