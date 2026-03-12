@@ -270,7 +270,7 @@ class StructuralEdgeMixer(nn.Module):
         scores = self.attn_score(
             torch.cat([msg, h_j, edge_feat], dim=-1)
         ).squeeze(-1)                                    # (B, L, K)
-        scores = scores.masked_fill(~valid_mask, -1e9)
+        scores = scores.masked_fill(~valid_mask, -1e4)
         attn   = torch.softmax(scores, dim=-1)           # (B, L, K)
         attn   = torch.nan_to_num(attn, nan=0.0)
 
@@ -570,7 +570,7 @@ class RNABenderModel(nn.Module):
         """Attention-weighted or mean pooling. Returns (B, d)."""
         if self.pool_attn is not None:
             scores  = self.pool_attn(h).squeeze(-1)           # (B, L)
-            scores  = scores.masked_fill(~seq_mask, -1e9)
+            scores  = scores.masked_fill(~seq_mask, -1e4)
             weights = torch.softmax(scores, dim=-1)
             weights = torch.nan_to_num(weights, nan=0.0)
             return (weights.unsqueeze(-1) * h).sum(dim=1)

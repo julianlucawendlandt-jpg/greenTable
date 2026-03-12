@@ -622,7 +622,7 @@ def train_fold(
     )
     total_steps = cfg.epochs * len(train_loader)
     sched  = WarmupCosineScheduler(opt, cfg.warmup_steps, total_steps)
-    scaler = torch.cuda.amp.GradScaler() if (cfg.use_amp and device.type == 'cuda') else None
+    scaler = torch.amp.GradScaler('cuda') if (cfg.use_amp and device.type == 'cuda') else None
 
     best_score   = -np.inf
     best_state:  Optional[Dict] = None
