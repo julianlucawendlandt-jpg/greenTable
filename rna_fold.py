@@ -566,14 +566,20 @@ def random_family_split(
     Single train/val split that keeps families intact (no family spans both sets).
 
     Randomly assigns entire families to train or val until val_frac is reached.
+
+    Determinism guarantee: unique families are first sorted, then shuffled with
+    the given seed.  set() ordering is NOT used — this ensures the same seed
+    always produces the same split regardless of insertion order or Python version.
     """
-    rng          = np.random.RandomState(seed)
-    unique_fams  = list(set(families))
+    from collections import Counter
+    rng        = np.random.RandomState(seed)
+    # Sort before shuffling — guarantees identical ordering across Python runs
+    unique_fams = sorted(set(families))
     rng.shuffle(unique_fams)
 
-    n            = len(families)
-    target_val   = int(n * val_frac)
-    fam_sizes    = {f: families.count(f) for f in unique_fams}
+    n          = len(families)
+    target_val = int(n * val_frac)
+    fam_sizes  = Counter(families)   # O(n), not O(n * n_families)
 
     val_fams: set = set()
     val_count = 0
@@ -584,7 +590,7 @@ def random_family_split(
         val_count += fam_sizes[fam]
 
     families_arr = np.array(families)
-    val_idx  = np.where(np.isin(families_arr, list(val_fams)))[0]
+    val_idx   = np.where( np.isin(families_arr, list(val_fams)))[0]
     train_idx = np.where(~np.isin(families_arr, list(val_fams)))[0]
     return train_idx, val_idx
 

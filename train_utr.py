@@ -48,8 +48,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 
 from rna_structure_plucker import RNAStructureGrassmann
-from rna_bender import RNABenderModel
+from rna_bender import RNABenderModel, VOCAB_SIZE
 from rna_baseline import RNATransformerBaseline
+from rna_moe_mrl import RNAMoEMRLModel
 from rna_fold import (
     RNAstralignDataset, collate_rnastralign,
     aggregate_structure_metrics, structure_metrics,
@@ -100,6 +101,14 @@ class TrainConfig:
     lambda_cons:  float = 0.0          # backbone–pairing consistency weight (disabled by default)
     lambda_pair:  float = 0.1          # pair-map (BPP supervision) weight
     use_pair_head:bool  = True         # include pair-map head
+
+    # MoE model (model_type='moe')
+    gate_type:           str           = 'scalar'  # 'scalar' | 'vector'
+    gate_bias:           float         = 0.0       # initial gate bias (0 = balanced)
+    pretrained_geom_encoder: Optional[str] = None  # path to geom encoder checkpoint
+    freeze_geom_epochs:  int           = 0         # freeze geom branch for N epochs
+    geom_lr_scale:       float         = 0.1       # LR multiplier for geom encoder
+    geom_num_layers:     int           = 4         # geometry branch depth (can differ from seq)
 
     # RNAstralign / folding task
     data_format:  str   = 'csv'        # 'csv' or 'bpseq' (rnastralign task only)
@@ -315,6 +324,54 @@ def load_pretrained_encoder(model: 'RNAStructureGrassmann', ckpt_path: str) -> i
     return n_loaded
 
 
+# ─── Architecture validation ──────────────────────────────────────────────────
+
+def _check_pretrained_geom_arch(cfg: 'TrainConfig') -> None:
+    """
+    Warn (not error) when key geometry-branch hyperparams don't match the
+    pretrained checkpoint.  A mismatch loads partially and can silently corrupt
+    experiments, so we surface it explicitly.
+
+    Checked fields (all present in pretrain_bender.py checkpoints):
+        model_dim, num_layers (geom_num_layers), reduced_dim
+    """
+    if not cfg.pretrained_geom_encoder:
+        return
+    try:
+        ckpt = torch.load(cfg.pretrained_geom_encoder, map_location='cpu',
+                          weights_only=False)
+    except Exception as e:
+        print(f'  [warn] Could not open pretrained geom checkpoint for arch check: {e}')
+        return
+
+    ckpt_cfg = ckpt.get('cfg', {})
+    if not ckpt_cfg:
+        return
+
+    mismatches = []
+    checks = [
+        ('model_dim',    'model_dim',   cfg.model_dim),
+        ('num_layers',   'num_layers',  cfg.geom_num_layers),
+        ('reduced_dim',  'reduced_dim', cfg.reduced_dim),
+    ]
+    for label, key, current_val in checks:
+        stored = ckpt_cfg.get(key)
+        if stored is not None and stored != current_val:
+            mismatches.append(f'{label}: ckpt={stored} vs current={current_val}')
+
+    oracle_ckpt = ckpt_cfg.get('oracle_edges', None)
+    if oracle_ckpt is not None:
+        edge_mode = 'oracle' if oracle_ckpt else 'sequence-only'
+        print(f'  [info] Pretrained geom encoder used {edge_mode} edges')
+
+    if mismatches:
+        print(f'  [WARN] Geometry encoder architecture mismatch — partial load likely:')
+        for m in mismatches:
+            print(f'         {m}')
+    else:
+        print(f'  [info] Pretrained geom encoder arch matches current config ✓')
+
+
 # ─── Model factory ────────────────────────────────────────────────────────────
 
 def build_model(cfg: TrainConfig):
@@ -339,6 +396,28 @@ def build_model(cfg: TrainConfig):
             aux_struct    = aux_struct,
             use_pair_head = cfg.use_pair_head,
         )
+
+    if cfg.model_type == 'moe':
+        # Two-branch MoE: sequence encoder + geometry (Bender) encoder + learned gate.
+        # The geometry branch can be initialised from a pretrained structure checkpoint.
+        model = RNAMoEMRLModel(
+            model_dim        = cfg.model_dim,
+            seq_num_layers   = cfg.num_layers,
+            seq_num_heads    = cfg.num_heads,
+            geom_num_layers  = cfg.geom_num_layers,
+            geom_reduced_dim = cfg.reduced_dim,
+            vocab_size       = VOCAB_SIZE,
+            max_len          = cfg.max_len or 256,
+            dropout          = cfg.dropout,
+            pooling          = cfg.pooling,
+            num_libraries    = num_libraries,
+            gate_type        = cfg.gate_type,
+            gate_bias        = cfg.gate_bias,
+        )
+        if cfg.pretrained_geom_encoder:
+            _check_pretrained_geom_arch(cfg)
+            model.load_pretrained_geom(cfg.pretrained_geom_encoder)
+        return model
 
     if cfg.model_type == 'bender':
         # For the folding task:
@@ -487,6 +566,7 @@ def evaluate(
 
     all_preds:  List[np.ndarray] = []
     all_labels: List[np.ndarray] = []
+    all_gates:  List[np.ndarray] = []
 
     for batch in loader:
         batch   = {k: (v.to(device) if isinstance(v, torch.Tensor) else v)
@@ -500,15 +580,28 @@ def evaluate(
         result = model(**batch, library_ids=lib_ids)
         if isinstance(result, dict):
             logits = result['task_logits']
+            if 'gate' in result:
+                all_gates.append(result['gate'].squeeze(-1).cpu().numpy())
         else:
             logits, _ = result
 
         all_preds.append(logits.cpu().numpy())
         all_labels.append(labels.cpu().numpy())
 
-    preds  = np.concatenate(all_preds)
-    labels = np.concatenate(all_labels)
-    return compute_metrics(preds, labels, task=task)
+    preds   = np.concatenate(all_preds)
+    labels  = np.concatenate(all_labels)
+    metrics = compute_metrics(preds, labels, task=task)
+
+    # Gate diagnostics (MoE only): mean/std can hide bimodal collapse, so also
+    # track tail fractions — if gate_lo_frac + gate_hi_frac ≈ 1, one branch dominates.
+    if all_gates:
+        g = np.concatenate(all_gates)
+        metrics['gate_mean']    = float(g.mean())
+        metrics['gate_std']     = float(g.std())
+        metrics['gate_lo_frac'] = float((g < 0.1).mean())   # fraction using geom only
+        metrics['gate_hi_frac'] = float((g > 0.9).mean())   # fraction using seq only
+
+    return metrics
 
 
 @torch.no_grad()
@@ -639,9 +732,14 @@ def train_fold(
         print(f'  Loaded pretrained encoder: {n_loaded:,} params '
               f'from {cfg.pretrained_backbone}')
 
-    opt = torch.optim.AdamW(
-        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
-    )
+    # MoE: differential LR and optional initial freeze of geometry encoder
+    if cfg.model_type == 'moe' and cfg.pretrained_geom_encoder:
+        if cfg.freeze_geom_epochs > 0:
+            model.freeze_geom_encoder()
+        param_groups = model.get_optimizer_groups(cfg.lr, cfg.geom_lr_scale)
+        opt = torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     total_steps = cfg.epochs * len(train_loader)
     sched  = WarmupCosineScheduler(opt, cfg.warmup_steps, total_steps)
     scaler = torch.amp.GradScaler('cuda') if (cfg.use_amp and device.type == 'cuda') else None
@@ -673,6 +771,16 @@ def train_fold(
         no_improve   = ckpt['no_improve']
         print(f'  Resumed from epoch {ckpt["epoch"]} '
               f'(best_score={best_score:.4f} @ epoch {best_epoch})')
+        # Restore freeze state: geometry encoder may still be frozen at this epoch
+        if (cfg.model_type == 'moe'
+                and cfg.pretrained_geom_encoder
+                and cfg.freeze_geom_epochs > 0):
+            if ckpt['epoch'] < cfg.freeze_geom_epochs:
+                model.freeze_geom_encoder()
+                print(f'  Resumed with geometry encoder frozen '
+                      f'(will unfreeze at epoch {cfg.freeze_geom_epochs + 1})')
+            else:
+                model.unfreeze_geom_encoder()
 
     val_size = len(val_dataset) if val_dataset is not None else len(val_idx)
     amp_tag  = 'AMP' if scaler else 'fp32'
@@ -681,6 +789,14 @@ def train_fold(
           f'| {n_params:,} params | {amp_tag} | eval_every={cfg.eval_every}{aux_tag}')
 
     for epoch in range(start_epoch, cfg.epochs + 1):
+        # MoE freeze/thaw: unfreeze geometry encoder after freeze_geom_epochs
+        if (cfg.model_type == 'moe'
+                and cfg.pretrained_geom_encoder
+                and cfg.freeze_geom_epochs > 0
+                and epoch == cfg.freeze_geom_epochs + 1):
+            model.unfreeze_geom_encoder()
+            print(f'    Epoch {epoch}: geometry encoder unfrozen')
+
         t0         = time.time()
         train_loss = train_epoch(model, train_loader, opt, sched, device,
                                  cfg.clip_grad, scaler, compute_loss_fn=loss_fn)
@@ -727,11 +843,30 @@ def train_fold(
     print(f'  Best @ epoch {best_epoch}: '
           + ' | '.join(f'{k}={v:.4f}' for k, v in best_metrics.items()))
 
-    # ── Save best model weights ─────────────────────────────────────���─────────
+    # ── Save best model weights ───────────────────────────────────────────────
     if cfg.save_best and best_state is not None:
         best_path = os.path.join(cfg.output_dir, f'{cfg.task}_fold{fold_num}_best.pt')
-        torch.save({'state_dict': best_state, 'metrics': best_metrics, 'cfg': cfg},
-                   best_path)
+        ckpt_payload: Dict = {
+            'state_dict':  best_state,
+            'metrics':     best_metrics,
+            'cfg':         cfg,
+            'best_epoch':  best_epoch,
+        }
+        if cfg.model_type == 'moe':
+            ckpt_payload['moe_meta'] = {
+                'pretrained_geom_encoder': cfg.pretrained_geom_encoder,
+                'freeze_geom_epochs':      cfg.freeze_geom_epochs,
+                'geom_lr_scale':           cfg.geom_lr_scale,
+                'geom_num_layers':         cfg.geom_num_layers,
+                'gate_type':               cfg.gate_type,
+                'gate_bias':               cfg.gate_bias,
+                # Gate summary at best epoch (from best_metrics if present)
+                'gate_mean':    best_metrics.get('gate_mean'),
+                'gate_std':     best_metrics.get('gate_std'),
+                'gate_lo_frac': best_metrics.get('gate_lo_frac'),
+                'gate_hi_frac': best_metrics.get('gate_hi_frac'),
+            }
+        torch.save(ckpt_payload, best_path)
         print(f'  Saved → {best_path}')
 
     # ── Final test-set evaluation (once, not used for selection) ──────────────
@@ -779,6 +914,12 @@ def run_cv(cfg: TrainConfig):
     print(f'Task: {cfg.task} | Data: {cfg.data} | Device: {cfg.device}')
     if cfg.model_type == 'transformer':
         print(f'Model: {cfg.model_type} | dim={cfg.model_dim} layers={cfg.num_layers} heads={cfg.num_heads}')
+    elif cfg.model_type == 'moe':
+        geom_src = f'pretrained({cfg.pretrained_geom_encoder})' if cfg.pretrained_geom_encoder else 'scratch'
+        print(f'Model: moe | dim={cfg.model_dim} '
+              f'seq_layers={cfg.num_layers} geom_layers={cfg.geom_num_layers} r={cfg.reduced_dim} '
+              f'gate={cfg.gate_type} geom={geom_src} freeze={cfg.freeze_geom_epochs}ep '
+              f'geom_lr×{cfg.geom_lr_scale}')
     else:
         print(f'Model: {cfg.model_type} | dim={cfg.model_dim} layers={cfg.num_layers} r={cfg.reduced_dim}')
     print(f'BPP backend: {cfg.bpp_backend} | Folds: {cfg.folds}')
@@ -895,10 +1036,11 @@ def parse_args() -> TrainConfig:
                         'evaluates on --test_data instead of doing CV')
     # Model
     p.add_argument('--model_type',   default='plucker',
-                   choices=['plucker', 'bender', 'transformer'],
+                   choices=['plucker', 'bender', 'transformer', 'moe'],
                    help='plucker      = original StructureEdgePlucker; '
                         'bender       = RNA Bender with Grassmann curvature; '
-                        'transformer  = standard MHA baseline (sequence-only)')
+                        'transformer  = standard MHA baseline (sequence-only); '
+                        'moe          = seq + geom mixture-of-experts')
     p.add_argument('--model_dim',    type=int,   default=128)
     p.add_argument('--num_layers',   type=int,   default=4)
     p.add_argument('--num_heads',    type=int,   default=8,
@@ -937,6 +1079,21 @@ def parse_args() -> TrainConfig:
     p.add_argument('--no_oracle_edges', action='store_true',
                    help='[rnastralign] Use only local/backbone edges; no ground-truth base '
                         'pairs in the input graph (sequence-only ablation)')
+    # MoE model
+    p.add_argument('--gate_type',    default='scalar', choices=['scalar', 'vector'],
+                   help='[moe] Gate output shape: scalar (B,1) or vector (B,d)')
+    p.add_argument('--gate_bias',    type=float, default=0.0,
+                   help='[moe] Initial gate bias (0=balanced, <0=trust seq more)')
+    p.add_argument('--pretrained_geom_encoder', default=None,
+                   help='[moe] Path to pretrained geometry encoder checkpoint '
+                        '(from pretrain_bender.py)')
+    p.add_argument('--freeze_geom_epochs', type=int, default=0,
+                   help='[moe] Keep geometry encoder frozen for first N epochs '
+                        'to protect the pretrained signal')
+    p.add_argument('--geom_lr_scale', type=float, default=0.1,
+                   help='[moe] LR multiplier for geometry encoder (prevents forgetting)')
+    p.add_argument('--geom_num_layers', type=int, default=4,
+                   help='[moe] Depth of geometry branch (can differ from seq branch)')
     # Training
     p.add_argument('--epochs',       type=int,   default=60)
     p.add_argument('--batch_size',   type=int,   default=64)
@@ -1020,6 +1177,12 @@ def parse_args() -> TrainConfig:
         test_data            = args.test_data,
         resume_from          = args.resume_from,
         pretrained_backbone  = args.pretrained_backbone,
+        gate_type            = args.gate_type,
+        gate_bias            = args.gate_bias,
+        pretrained_geom_encoder = args.pretrained_geom_encoder,
+        freeze_geom_epochs   = args.freeze_geom_epochs,
+        geom_lr_scale        = args.geom_lr_scale,
+        geom_num_layers      = args.geom_num_layers,
     )
     if args.label_col:
         cfg.label_col = args.label_col
