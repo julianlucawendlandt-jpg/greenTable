@@ -28,6 +28,7 @@ Usage examples:
 
 import argparse
 import dataclasses
+import json
 import os
 import time
 import warnings
@@ -121,6 +122,7 @@ class TrainConfig:
     val_frac:     float = 0.2         # used only when folds == 1
     stratify:     bool  = True        # stratified fold split for regression
     seed:         int   = 42
+    split_file:   Optional[str] = None  # path to save/load split indices (JSON)
 
     # Speed / precision
     use_amp:      bool  = True         # mixed-precision (CUDA only; auto-disabled on CPU)
@@ -797,7 +799,15 @@ def run_cv(cfg: TrainConfig):
 
     # Build fold splits
     hold_out_ds: Optional[object] = None   # test set, evaluated once at the end
-    if cfg.test_data is not None:
+    if cfg.split_file and os.path.exists(cfg.split_file):
+        # ── Load previously saved split (guarantees identical train/val for comparison) ──
+        with open(cfg.split_file) as _f:
+            _saved = json.load(_f)
+        folds        = [(np.array(s['train']), np.array(s['val'])) for s in _saved['folds']]
+        val_datasets = [None] * len(folds)
+        print(f'Split loaded: {cfg.split_file} ({len(folds)} fold(s), '
+              f'{len(folds[0][0])} train / {len(folds[0][1])} val)')
+    elif cfg.test_data is not None:
         test_cfg    = dataclasses.replace(cfg, data=cfg.test_data)
         hold_out_ds = build_dataset(test_cfg)
         idx   = np.random.permutation(n)
@@ -829,6 +839,14 @@ def run_cv(cfg: TrainConfig):
     else:
         folds  = kfold_indices(n, k=cfg.folds, seed=cfg.seed)
         val_datasets = [None] * len(folds)
+
+    # ── Optionally save split for reproducibility ──────────────────────────────
+    if cfg.split_file and not os.path.exists(cfg.split_file):
+        os.makedirs(os.path.dirname(os.path.abspath(cfg.split_file)), exist_ok=True)
+        with open(cfg.split_file, 'w') as _f:
+            json.dump({'folds': [{'train': tr.tolist(), 'val': va.tolist()}
+                                 for tr, va in folds]}, _f)
+        print(f'Split saved: {cfg.split_file}')
 
     all_metrics: List[Dict[str, float]] = []
     for fold_i, ((tr_idx, va_idx), val_ds) in enumerate(zip(folds, val_datasets)):
@@ -933,6 +951,9 @@ def parse_args() -> TrainConfig:
     p.add_argument('--no_stratify',  action='store_true',
                    help='Disable stratified k-fold for regression tasks')
     p.add_argument('--seed',         type=int,   default=42)
+    p.add_argument('--split_file',   default=None,
+                   help='JSON file to save (first run) or load (subsequent runs) exact '
+                        'train/val indices.  Guarantees both models train on the same split.')
     # Speed / precision
     p.add_argument('--no_amp',       action='store_true',
                    help='Disable mixed-precision (AMP); use full fp32')
@@ -991,6 +1012,7 @@ def parse_args() -> TrainConfig:
         val_frac     = args.val_frac,
         stratify     = not args.no_stratify,
         seed         = args.seed,
+        split_file   = args.split_file,
         device       = args.device,
         num_workers  = args.num_workers,
         output_dir   = args.output_dir,
