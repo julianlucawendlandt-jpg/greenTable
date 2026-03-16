@@ -701,10 +701,15 @@ class RNABenderModel(nn.Module):
     def forward(
         self,
         input_ids:   torch.Tensor,
-        edge_idx:    torch.Tensor,
-        edge_feat:   torch.Tensor,
         seq_mask:    torch.Tensor,
-        # kept for backward compat with the old (logits, loss) callers
+        # Primary edge inputs (rnastralign / folding collate names)
+        edge_idx:    Optional[torch.Tensor] = None,
+        edge_feat:   Optional[torch.Tensor] = None,
+        # Alias names used by UTR collate (collate_rna) — mapped to edge_idx/edge_feat
+        edge_index:  Optional[torch.Tensor] = None,
+        edge_attrs:  Optional[torch.Tensor] = None,
+        edge_mask:   Optional[torch.Tensor] = None,   # accepted but not used
+        # Task labels
         labels:      Optional[torch.Tensor] = None,
         library_ids: Optional[torch.Tensor] = None,
         ss_labels:   Optional[torch.Tensor] = None,
@@ -732,6 +737,10 @@ class RNABenderModel(nn.Module):
             edge_feat     : the input edge_feat (forwarded for loss helpers)
             loss          : scalar total loss, present only when labels is not None
         """
+        # Accept UTR-collate names (edge_index / edge_attrs) as aliases
+        if edge_idx  is None: edge_idx  = edge_index
+        if edge_feat is None: edge_feat = edge_attrs
+
         h, p_bb1_list, kappa_list, p_struct_list = self.encode(
             input_ids, edge_idx, edge_feat, seq_mask
         )

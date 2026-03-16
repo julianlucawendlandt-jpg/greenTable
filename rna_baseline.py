@@ -168,10 +168,15 @@ class RNATransformerBaseline(nn.Module):
 
     def forward(
         self,
-        input_ids:   torch.Tensor,            # (B, L) int64
-        edge_idx:    torch.Tensor,            # (B, L, K) — accepted but ignored
-        edge_feat:   torch.Tensor,            # (B, L, K, E) — accepted but ignored
-        seq_mask:    torch.Tensor,            # (B, L) bool  True = valid
+        input_ids:   torch.Tensor,                    # (B, L) int64
+        seq_mask:    torch.Tensor,                    # (B, L) bool  True = valid
+        # Folding-collate names (rnastralign)
+        edge_idx:    Optional[torch.Tensor] = None,   # ignored — sequence-only model
+        edge_feat:   Optional[torch.Tensor] = None,   # ignored
+        # UTR-collate aliases (collate_rna) — accepted so both datasets work
+        edge_index:  Optional[torch.Tensor] = None,   # ignored
+        edge_attrs:  Optional[torch.Tensor] = None,   # ignored
+        edge_mask:   Optional[torch.Tensor] = None,   # ignored
         labels:      Optional[torch.Tensor] = None,   # unused (folding loss is external)
         library_ids: Optional[torch.Tensor] = None,
         ss_labels:   Optional[torch.Tensor] = None,
@@ -185,10 +190,10 @@ class RNATransformerBaseline(nn.Module):
             kappa_list    : []
             p_bb1_list    : []
             p_struct_list : []
-            edge_feat     : forwarded
+            edge_feat     : None (no edge inputs used)
 
-        Note: edge_idx and edge_feat are accepted for API compatibility but
-        are not used — this model operates on sequence only.
+        All edge arguments (edge_idx/edge_feat/edge_index/edge_attrs/edge_mask)
+        are accepted for API compatibility but ignored — pure sequence model.
         """
         B, L = input_ids.shape
         pos  = torch.arange(L, device=input_ids.device).unsqueeze(0).expand(B, -1)
@@ -204,7 +209,7 @@ class RNATransformerBaseline(nn.Module):
             'kappa_list':    [],
             'p_bb1_list':    [],
             'p_struct_list': [],
-            'edge_feat':     edge_feat,
+            'edge_feat':     edge_feat if edge_feat is not None else edge_attrs,
         }
 
         if self.aux_struct and self.ss_head is not None:
