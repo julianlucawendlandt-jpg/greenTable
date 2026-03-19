@@ -46,8 +46,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 
-from rna_encoders import RNABenderEncoder
-from rna_bender import VOCAB_SIZE, PairMapHead
+from rna_encoders import RNABenderEncoder, _pool
+from rna_bender import VOCAB_SIZE, PAD_ID, PairMapHead
 from rna_fold import (
     RNAstralignDataset, collate_rnastralign,
     folding_loss, aggregate_structure_metrics, structure_metrics,
@@ -60,10 +60,15 @@ from train_utr import WarmupCosineScheduler
 
 class BenderPretrainModel(nn.Module):
     """
-    RNABenderEncoder + pair map head + SS head for structure pretraining.
+    RNABenderEncoder + pair map head + SS head + MFE head for structure pretraining.
 
-    After training, only encoder.state_dict() is saved.
-    The heads are discarded — they were scaffolding for pretraining.
+    All three heads are saved alongside the encoder in the output checkpoint so
+    that RNAHybridModel.load_pretrained_geom() can fully initialise Stage A,
+    making freeze_stage_a() safe to use.
+
+    MFE supervision is applied when the batch provides an 'mfe' key; for the
+    RNAstralign dataset this key is absent and the MFE head is updated only via
+    gradients flowing through the bottleneck → pair/SS path (indirect signal).
     """
 
     def __init__(
@@ -76,7 +81,7 @@ class BenderPretrainModel(nn.Module):
         max_len:     int           = 256,
     ):
         super().__init__()
-        self.encoder  = RNABenderEncoder(
+        self.encoder   = RNABenderEncoder(
             model_dim   = model_dim,
             num_layers  = num_layers,
             reduced_dim = reduced_dim,
@@ -86,8 +91,11 @@ class BenderPretrainModel(nn.Module):
         )
         self.pair_head = PairMapHead(model_dim)
         self.ss_head   = nn.Linear(model_dim, 3)
-        nn.init.xavier_uniform_(self.ss_head.weight)
-        nn.init.zeros_(self.ss_head.bias)
+        self.mfe_pool  = nn.Linear(model_dim, 1)   # attention weights for MFE pooling
+        self.mfe_head  = nn.Linear(model_dim, 1)   # pooled → MFE scalar
+        for m in [self.ss_head, self.mfe_pool, self.mfe_head]:
+            nn.init.xavier_uniform_(m.weight)
+            nn.init.zeros_(m.bias)
 
     def get_num_params(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -95,9 +103,11 @@ class BenderPretrainModel(nn.Module):
     def forward(self, input_ids, edge_idx, edge_feat, seq_mask):
         h, _, geom_aux = self.encoder.encode(input_ids, edge_idx, edge_feat, seq_mask)
         pair_logits, _ = self.pair_head(h, seq_mask)
+        mfe_pred = self.mfe_head(_pool(h, seq_mask, self.mfe_pool)).squeeze(-1)  # (B,)
         return {
             'pair_logits':   pair_logits,
             'ss_logits':     self.ss_head(h),
+            'mfe_pred':      mfe_pred,
             'kappa_list':    geom_aux['kappa_list'],
             'p_bb1_list':    geom_aux['p_bb1_list'],
             'p_struct_list': geom_aux['p_struct_list'],
@@ -122,6 +132,7 @@ class PretrainBenderConfig:
 
     lambda_pair:   float = 1.0
     lambda_ss:     float = 0.1
+    lambda_mfe:    float = 0.01   # MFE regression; only used when batch has 'mfe'
     lambda_curv:   float = 0.01
 
     epochs:        int   = 60
@@ -176,6 +187,13 @@ def pretrain_epoch(
                 lambda_curv  = cfg.lambda_curv,
                 lambda_cons  = 0.0,
             )
+            # MFE supervision when available (not in rnastralign, but works for
+            # any dataset that provides an 'mfe' key in the batch)
+            if cfg.lambda_mfe > 0 and 'mfe' in batch:
+                import torch.nn.functional as F
+                loss = loss + cfg.lambda_mfe * F.mse_loss(
+                    outputs['mfe_pred'], batch['mfe'].to(device).float()
+                )
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -363,6 +381,14 @@ def run_pretrain(cfg: PretrainBenderConfig):
                 no_improve   = 0
                 torch.save({
                     'geom_encoder_state_dict': best_enc_sd,
+                    'pair_head_state_dict': {k: v.cpu().clone()
+                                             for k, v in model.pair_head.state_dict().items()},
+                    'ss_head_state_dict':   {k: v.cpu().clone()
+                                             for k, v in model.ss_head.state_dict().items()},
+                    'mfe_head_state_dict':  {k: v.cpu().clone()
+                                             for k, v in model.mfe_head.state_dict().items()},
+                    'mfe_pool_state_dict':  {k: v.cpu().clone()
+                                             for k, v in model.mfe_pool.state_dict().items()},
                     'epoch': epoch,
                     'val_metrics': best_metrics,
                     'cfg': dataclasses.asdict(cfg),
@@ -412,6 +438,8 @@ def parse_args() -> PretrainBenderConfig:
     p.add_argument('--dropout',       type=float, default=0.1)
     p.add_argument('--lambda_pair',   type=float, default=1.0)
     p.add_argument('--lambda_ss',     type=float, default=0.1)
+    p.add_argument('--lambda_mfe',    type=float, default=0.01,
+                   help='MFE regression weight (only active when batch has mfe key)')
     p.add_argument('--lambda_curv',   type=float, default=0.01)
     p.add_argument('--epochs',        type=int,   default=60)
     p.add_argument('--batch_size',    type=int,   default=32)
@@ -437,6 +465,7 @@ def parse_args() -> PretrainBenderConfig:
         dropout       = args.dropout,
         lambda_pair   = args.lambda_pair,
         lambda_ss     = args.lambda_ss,
+        lambda_mfe    = args.lambda_mfe,
         lambda_curv   = args.lambda_curv,
         epochs        = args.epochs,
         batch_size    = args.batch_size,

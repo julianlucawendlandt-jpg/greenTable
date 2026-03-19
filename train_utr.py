@@ -51,6 +51,7 @@ from rna_structure_plucker import RNAStructureGrassmann
 from rna_bender import RNABenderModel, VOCAB_SIZE
 from rna_baseline import RNATransformerBaseline
 from rna_moe_mrl import RNAMoEMRLModel
+from rna_hybrid import RNAHybridModel
 from rna_fold import (
     RNAstralignDataset, collate_rnastralign,
     aggregate_structure_metrics, structure_metrics,
@@ -109,6 +110,13 @@ class TrainConfig:
     freeze_geom_epochs:  int           = 0         # freeze geom branch for N epochs
     geom_lr_scale:       float         = 0.1       # LR multiplier for geom encoder
     geom_num_layers:     int           = 4         # geometry branch depth (can differ from seq)
+
+    # Hybrid model (model_type='hybrid')
+    seq_dim:               int         = 128       # Stage B sequence encoder hidden dim
+    seq_num_layers_hybrid: int         = 2         # Stage B sequence encoder depth
+    struct_bottleneck_dim: int         = 64        # per-token structure bottleneck dim
+    glob_bottleneck_dim:   int         = 128       # global structure bottleneck dim
+    bottleneck_mode:       str         = 'full'    # 'full' | 'simple' (ablation)
 
     # RNAstralign / folding task
     data_format:  str   = 'csv'        # 'csv' or 'bpseq' (rnastralign task only)
@@ -439,6 +447,65 @@ def build_model(cfg: TrainConfig):
             model.load_pretrained_geom(cfg.pretrained_geom_encoder)
         return model
 
+    if cfg.model_type == 'hybrid':
+        # Two-stage hybrid: Stage A = geometry encoder + structure bottleneck,
+        # Stage B = small sequence encoder + cross-attention bridge from structure.
+        # Same auto-read-arch-from-checkpoint logic as 'moe'.
+        geom_layers  = cfg.geom_num_layers
+        geom_r       = cfg.reduced_dim
+        geom_max_len = None
+        geom_dim     = cfg.model_dim   # may be overridden from checkpoint below
+
+        if cfg.pretrained_geom_encoder:
+            try:
+                _ckpt = torch.load(cfg.pretrained_geom_encoder, map_location='cpu',
+                                   weights_only=False)
+                _cc = _ckpt.get('cfg', {})
+                if _cc:
+                    geom_layers  = _cc.get('num_layers',  geom_layers)
+                    geom_r       = _cc.get('reduced_dim', geom_r)
+                    geom_max_len = _cc.get('max_len') or geom_max_len
+                    # model_dim is critical — mismatching it causes a broken load
+                    _ckpt_dim = _cc.get('model_dim')
+                    if _ckpt_dim is not None and _ckpt_dim != geom_dim:
+                        print(f'  [info] geom_dim auto-corrected: '
+                              f'{geom_dim} → {_ckpt_dim} (from checkpoint; '
+                              f'pass --model_dim {_ckpt_dim} to silence this)')
+                        geom_dim = _ckpt_dim
+                    print(f'  [info] Geom branch arch from checkpoint: '
+                          f'dim={geom_dim} layers={geom_layers} r={geom_r} max_len={geom_max_len}')
+            except Exception as e:
+                print(f'  [warn] Could not read pretrained geom cfg: {e}')
+            _check_pretrained_geom_arch(cfg)
+
+        model = RNAHybridModel(
+            vocab_size            = VOCAB_SIZE,
+            max_len               = cfg.max_len or 256,
+            geom_dim              = geom_dim,
+            geom_num_layers       = geom_layers,
+            geom_reduced_dim      = geom_r,
+            geom_ff_dim           = cfg.ff_dim,
+            geom_max_len          = geom_max_len,
+            struct_bottleneck_dim = cfg.struct_bottleneck_dim,
+            glob_bottleneck_dim   = cfg.glob_bottleneck_dim,
+            seq_dim               = cfg.seq_dim,
+            seq_num_layers        = cfg.seq_num_layers_hybrid,
+            seq_num_heads         = cfg.num_heads,
+            seq_ff_dim            = cfg.ff_dim,
+            dropout               = cfg.dropout,
+            pooling               = cfg.pooling,
+            num_libraries         = num_libraries,
+            lambda_pair           = cfg.lambda_pair,
+            lambda_ss             = cfg.lambda_ss,
+            lambda_mfe            = cfg.lambda_mfe,
+            lambda_curv           = cfg.lambda_curv,
+            lambda_cons           = cfg.lambda_cons,
+            bottleneck_mode       = cfg.bottleneck_mode,
+        )
+        if cfg.pretrained_geom_encoder:
+            model.load_pretrained_geom(cfg.pretrained_geom_encoder)
+        return model
+
     if cfg.model_type == 'bender':
         # For the folding task:
         #   task='folding'    → skips building the pooled task head entirely
@@ -697,6 +764,33 @@ def _make_folding_loss_fn(cfg: 'TrainConfig'):
     return _loss
 
 
+# ─── Freeze / unfreeze helpers ────────────────────────────────────────────────
+
+def _freeze_pretrained(model) -> str:
+    """Freeze the right pretrained components and return a description string.
+
+    For RNAHybridModel: if structure heads were loaded from a checkpoint, freeze
+    encoder + heads (struct_bottleneck stays trainable — it was not pretrained).
+    Otherwise fall back to encoder-backbone-only freeze.
+
+    For all other models (MoE, etc.): freeze_geom_encoder() (backbone only).
+    """
+    if hasattr(model, '_heads_loaded') and model._heads_loaded:
+        model.freeze_encoder_and_heads()
+        return 'encoder + structure heads frozen (bottleneck stays trainable)'
+    model.freeze_geom_encoder()
+    return 'geometry encoder backbone frozen'
+
+
+def _unfreeze_pretrained(model) -> str:
+    """Reverse of _freeze_pretrained — unfreeze the same component set."""
+    if hasattr(model, '_heads_loaded') and model._heads_loaded:
+        model.unfreeze_encoder_and_heads()
+        return 'encoder + structure heads unfrozen'
+    model.unfreeze_geom_encoder()
+    return 'geometry encoder backbone unfrozen'
+
+
 # ─── Single fold training ─────────────────────────────────────────────────────
 
 def train_fold(
@@ -752,10 +846,11 @@ def train_fold(
         print(f'  Loaded pretrained encoder: {n_loaded:,} params '
               f'from {cfg.pretrained_backbone}')
 
-    # MoE: differential LR and optional initial freeze of geometry encoder
-    if cfg.model_type == 'moe' and cfg.pretrained_geom_encoder:
+    # MoE / Hybrid: differential LR and optional initial freeze of geometry encoder
+    if cfg.model_type in ('moe', 'hybrid') and cfg.pretrained_geom_encoder:
         if cfg.freeze_geom_epochs > 0:
-            model.freeze_geom_encoder()
+            freeze_desc = _freeze_pretrained(model)
+            print(f'  Freeze schedule: {freeze_desc} for {cfg.freeze_geom_epochs} epochs')
         param_groups = model.get_optimizer_groups(cfg.lr, cfg.geom_lr_scale)
         opt = torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
     else:
@@ -791,16 +886,16 @@ def train_fold(
         no_improve   = ckpt['no_improve']
         print(f'  Resumed from epoch {ckpt["epoch"]} '
               f'(best_score={best_score:.4f} @ epoch {best_epoch})')
-        # Restore freeze state: geometry encoder may still be frozen at this epoch
-        if (cfg.model_type == 'moe'
+        # Restore freeze state: pretrained components may still be frozen at this epoch
+        if (cfg.model_type in ('moe', 'hybrid')
                 and cfg.pretrained_geom_encoder
                 and cfg.freeze_geom_epochs > 0):
             if ckpt['epoch'] < cfg.freeze_geom_epochs:
-                model.freeze_geom_encoder()
-                print(f'  Resumed with geometry encoder frozen '
+                freeze_desc = _freeze_pretrained(model)
+                print(f'  Resumed with {freeze_desc} '
                       f'(will unfreeze at epoch {cfg.freeze_geom_epochs + 1})')
             else:
-                model.unfreeze_geom_encoder()
+                _unfreeze_pretrained(model)
 
     val_size = len(val_dataset) if val_dataset is not None else len(val_idx)
     amp_tag  = 'AMP' if scaler else 'fp32'
@@ -809,13 +904,13 @@ def train_fold(
           f'| {n_params:,} params | {amp_tag} | eval_every={cfg.eval_every}{aux_tag}')
 
     for epoch in range(start_epoch, cfg.epochs + 1):
-        # MoE freeze/thaw: unfreeze geometry encoder after freeze_geom_epochs
-        if (cfg.model_type == 'moe'
+        # MoE / Hybrid freeze/thaw: unfreeze pretrained components after freeze_geom_epochs
+        if (cfg.model_type in ('moe', 'hybrid')
                 and cfg.pretrained_geom_encoder
                 and cfg.freeze_geom_epochs > 0
                 and epoch == cfg.freeze_geom_epochs + 1):
-            model.unfreeze_geom_encoder()
-            print(f'    Epoch {epoch}: geometry encoder unfrozen')
+            unfreeze_desc = _unfreeze_pretrained(model)
+            print(f'    Epoch {epoch}: {unfreeze_desc}')
 
         t0         = time.time()
         train_loss = train_epoch(model, train_loader, opt, sched, device,
@@ -940,6 +1035,12 @@ def run_cv(cfg: TrainConfig):
               f'seq_layers={cfg.num_layers} geom_layers={cfg.geom_num_layers} r={cfg.reduced_dim} '
               f'gate={cfg.gate_type} geom={geom_src} freeze={cfg.freeze_geom_epochs}ep '
               f'geom_lr×{cfg.geom_lr_scale}')
+    elif cfg.model_type == 'hybrid':
+        geom_src = f'pretrained({cfg.pretrained_geom_encoder})' if cfg.pretrained_geom_encoder else 'scratch'
+        print(f'Model: hybrid | geom_dim={cfg.model_dim} geom_layers={cfg.geom_num_layers} r={cfg.reduced_dim} '
+              f'seq_dim={cfg.seq_dim} seq_layers={cfg.seq_num_layers_hybrid} heads={cfg.num_heads} '
+              f'btok={cfg.struct_bottleneck_dim} bglob={cfg.glob_bottleneck_dim} '
+              f'geom={geom_src} freeze={cfg.freeze_geom_epochs}ep geom_lr×{cfg.geom_lr_scale}')
     else:
         print(f'Model: {cfg.model_type} | dim={cfg.model_dim} layers={cfg.num_layers} r={cfg.reduced_dim}')
     print(f'BPP backend: {cfg.bpp_backend} | Folds: {cfg.folds}')
@@ -1056,11 +1157,12 @@ def parse_args() -> TrainConfig:
                         'evaluates on --test_data instead of doing CV')
     # Model
     p.add_argument('--model_type',   default='plucker',
-                   choices=['plucker', 'bender', 'transformer', 'moe'],
+                   choices=['plucker', 'bender', 'transformer', 'moe', 'hybrid'],
                    help='plucker      = original StructureEdgePlucker; '
                         'bender       = RNA Bender with Grassmann curvature; '
                         'transformer  = standard MHA baseline (sequence-only); '
-                        'moe          = seq + geom mixture-of-experts')
+                        'moe          = seq + geom mixture-of-experts; '
+                        'hybrid       = two-stage: geometry bottleneck + seq cross-attn')
     p.add_argument('--model_dim',    type=int,   default=128)
     p.add_argument('--num_layers',   type=int,   default=4)
     p.add_argument('--num_heads',    type=int,   default=8,
@@ -1113,7 +1215,19 @@ def parse_args() -> TrainConfig:
     p.add_argument('--geom_lr_scale', type=float, default=0.1,
                    help='[moe] LR multiplier for geometry encoder (prevents forgetting)')
     p.add_argument('--geom_num_layers', type=int, default=4,
-                   help='[moe] Depth of geometry branch (can differ from seq branch)')
+                   help='[moe/hybrid] Depth of geometry branch (can differ from seq branch)')
+    # Hybrid model
+    p.add_argument('--seq_dim',        type=int, default=128,
+                   help='[hybrid] Stage B sequence encoder hidden dim')
+    p.add_argument('--seq_num_layers_hybrid', type=int, default=2,
+                   help='[hybrid] Stage B sequence encoder depth')
+    p.add_argument('--struct_bottleneck_dim', type=int, default=64,
+                   help='[hybrid] Per-token structure bottleneck dimension')
+    p.add_argument('--glob_bottleneck_dim',   type=int, default=128,
+                   help='[hybrid] Global structure bottleneck dimension')
+    p.add_argument('--bottleneck_mode',  default='full', choices=['full', 'simple'],
+                   help='[hybrid] Bottleneck variant: full=[H∥partner_ctx∥degree∥ss∥curv], '
+                        'simple=[H∥partner_ctx∥curv] (cleaner ablation)')
     # Training
     p.add_argument('--epochs',       type=int,   default=60)
     p.add_argument('--batch_size',   type=int,   default=64)
@@ -1203,6 +1317,11 @@ def parse_args() -> TrainConfig:
         freeze_geom_epochs   = args.freeze_geom_epochs,
         geom_lr_scale        = args.geom_lr_scale,
         geom_num_layers      = args.geom_num_layers,
+        seq_dim              = args.seq_dim,
+        seq_num_layers_hybrid = args.seq_num_layers_hybrid,
+        struct_bottleneck_dim = args.struct_bottleneck_dim,
+        glob_bottleneck_dim  = args.glob_bottleneck_dim,
+        bottleneck_mode      = args.bottleneck_mode,
     )
     if args.label_col:
         cfg.label_col = args.label_col
