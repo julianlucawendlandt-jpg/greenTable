@@ -288,7 +288,16 @@ class StructureBottleneck(nn.Module):
         # Normalised pair entropy: raw / log(eligible_partners).
         # Raw entropy grows with n_valid_j, so a fixed threshold confounds length and ambiguity.
         # Normalised entropy ∈ [0, 1]: 0 = perfectly paired, 1 = maximally diffuse.
-        pair_entropy_norm = pair_entropy / (n_valid_j.float().log().clamp(min=eps))  # (B, L, 1)
+        #
+        # Numerical safety (critical for AMP/fp16):
+        #   - When n_valid_j=1, log(1)=0; use clamp(min=1e-4) not 1e-8 to avoid
+        #     dividing small-but-nonzero entropy residuals by a near-zero denominator,
+        #     which in fp16 can reach 65504 and corrupt gradients over many epochs.
+        #   - Hard-clamp output to [0, 1] since theoretically entropy_norm ≤ 1.
+        #   - nan_to_num as final guard against any remaining edge cases.
+        log_n_valid = n_valid_j.float().log().clamp(min=1e-4)                    # (B, L, 1)
+        pair_entropy_norm = (pair_entropy / log_n_valid).clamp(0.0, 1.0)         # (B, L, 1)
+        pair_entropy_norm = torch.nan_to_num(pair_entropy_norm, nan=0.0)
         ss_lp      = self.ss_logit_proj(ss_logits)                             # (B, L, ss_proj_dim)
 
         # ── Multi-view partner context ─────────────────────────────────────────
@@ -341,6 +350,9 @@ class StructureBottleneck(nn.Module):
             local_pair_mass, distal_pair_mass,
             win_up_w3, win_up_w7, win_ent_w7,
         ], dim=-1) * mf.unsqueeze(-1)                                          # (B, L, 10)
+        # Safety: nan_to_num before stats_tok leaves the bottleneck.
+        # Prevents any residual fp16 edge-case from poisoning the stats injection path.
+        B_stats_tok = torch.nan_to_num(B_stats_tok, nan=0.0, posinf=1.0, neginf=0.0)
 
         # ── Two-branch fusion ──────────────────────────────────────────────────
         content_in = torch.cat([H_geom, partner_ctx_mean, partner_ctx_topk, curv], dim=-1)
