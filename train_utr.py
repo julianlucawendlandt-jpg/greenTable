@@ -1050,7 +1050,7 @@ def run_cv(cfg: TrainConfig):
         print(f'Bender losses: λ_curv={cfg.lambda_curv} λ_cons={cfg.lambda_cons} λ_pair={cfg.lambda_pair}')
 
     dataset = build_dataset(cfg)
-    n       = len(dataset)
+    n = len(dataset)
     if cfg.task == 'rnastralign':
         task = 'rnastralign'
     elif cfg.task == 'ires':
@@ -1157,12 +1157,13 @@ def parse_args() -> TrainConfig:
                         'evaluates on --test_data instead of doing CV')
     # Model
     p.add_argument('--model_type',   default='plucker',
-                   choices=['plucker', 'bender', 'transformer', 'moe', 'hybrid'],
-                   help='plucker      = original StructureEdgePlucker; '
-                        'bender       = RNA Bender with Grassmann curvature; '
+                   choices=['plucker', 'bender', 'transformer', 'moe', 'hybrid', 'fcgrcnn'],
+                   help='plucker  = original StructureEdgePlucker; '
+                        'bender = RNA Bender with Grassmann curvature; '
                         'transformer  = standard MHA baseline (sequence-only); '
-                        'moe          = seq + geom mixture-of-experts; '
-                        'hybrid       = two-stage: geometry bottleneck + seq cross-attn')
+                        'moe  = seq + geom mixture-of-experts; '
+                        'hybrid   = two-stage: geometry bottleneck + seq cross-attn'
+                        'fcgrcnn = fcgr based cnn approach')
     p.add_argument('--model_dim',    type=int,   default=128)
     p.add_argument('--num_layers',   type=int,   default=4)
     p.add_argument('--num_heads',    type=int,   default=8,
