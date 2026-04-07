@@ -1074,6 +1074,17 @@ def run_eval(cfg: TrainConfig):
         print('  Stored val metrics: '
               + ' | '.join(f'{k}={v:.4f}' for k, v in stored_metrics.items()))
 
+    # ── Infer pos_emb_type from checkpoint when not specified on CLI ──────────
+    # Checkpoints saved before --pos_emb_type was added used learned embeddings.
+    if 'pos_emb.weight' in raw_state:
+        if cfg.pos_emb_type != 'learned':
+            print('  NOTE: checkpoint has learned pos embedding — overriding --pos_emb_type to "learned"')
+            cfg = dataclasses.replace(cfg, pos_emb_type='learned')
+        # Set max_len to match the saved embedding size so the model is built correctly
+        ckpt_max_len = raw_state['pos_emb.weight'].shape[0]
+        if (cfg.max_len or 4096) != ckpt_max_len:
+            cfg = dataclasses.replace(cfg, max_len=ckpt_max_len)
+
     # ── Build model and load weights ──────────────────────────────────────────
     model = build_model(cfg).to(device)
     n_params = model.get_num_params()
