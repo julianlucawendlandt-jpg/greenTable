@@ -575,12 +575,21 @@ def random_family_split(
     rng        = np.random.RandomState(seed)
     # Sort before shuffling — guarantees identical ordering across Python runs
     unique_fams = sorted(set(families))
-    rng.shuffle(unique_fams)
 
     n          = len(families)
     target_val = int(n * val_frac)
     fam_sizes  = Counter(families)   # O(n), not O(n * n_families)
 
+    # Fall back to sequence-level random split when there is only one family or
+    # the smallest family alone already exceeds target_val (i.e. no valid
+    # family-level split exists).
+    min_fam_size = min(fam_sizes.values())
+    if len(unique_fams) == 1 or min_fam_size > target_val:
+        idx   = rng.permutation(n)
+        split = n - int(n * val_frac)
+        return idx[:split], idx[split:]
+
+    rng.shuffle(unique_fams)
     val_fams: set = set()
     val_count = 0
     for fam in unique_fams:
