@@ -311,7 +311,7 @@ class LocalEnergyHead(nn.Module):
 
     def forward(
         self,
-        h:     torch.Tensor,   # (B, L, d)
+        h: torch.Tensor,   # (B, L, d)
         z:     torch.Tensor,   # (B, L, r)
         p:     torch.Tensor,   # (B, L, plu_dim)
         kappa: torch.Tensor,   # (B, L, plu_dim)

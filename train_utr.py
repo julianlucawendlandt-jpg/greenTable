@@ -46,6 +46,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
+try:
+    from tqdm import tqdm as _tqdm
+    def _progress(it, **kw): return _tqdm(it, **kw)
+except ImportError:
+    def _progress(it, **kw): return it
 
 from rna_structure_plucker import RNAStructureGrassmann
 from rna_bender import RNABenderModel, VOCAB_SIZE
@@ -633,7 +638,11 @@ def train_epoch(
     total_loss = 0.0
     use_amp    = scaler is not None
 
-    for batch in loader:
+    pbar = _progress(loader, desc='train', leave=False,
+                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] loss={postfix[0]:.4f}',
+                     postfix=[0.0])
+    n_batches = 0
+    for batch in pbar:
         # Move all tensor values to device; keep non-tensor items (e.g. 'families') aside
         batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v)
                  for k, v in batch.items()}
@@ -678,6 +687,8 @@ def train_epoch(
 
         scheduler.step()
         total_loss += loss.item()
+        n_batches  += 1
+        pbar.postfix[0] = total_loss / n_batches
 
     return total_loss / max(len(loader), 1)
 
