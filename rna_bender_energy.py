@@ -431,7 +431,7 @@ class PairEnergyHead(nn.Module):
 
         # Mask out padded positions
         valid  = seq_mask.unsqueeze(2) & seq_mask.unsqueeze(1)
-        e_pair = e_pair.masked_fill(~valid, 1e9)
+        e_pair = e_pair.masked_fill(~valid, 3e4)   # fp16-safe forbidden sentinel
         return e_pair
 
 
@@ -900,7 +900,7 @@ class RNABenderEnergyModel(nn.Module):
         e_local = self.local_head(h, z, p_bb1, kappa)                  # (B, L)
         e_unp   = self.unpaired_head(h, z, p_bb1)                      # (B, L)
         e_pair  = self.pair_head(h, z, p_bb1, seq_mask, canon_mask)    # (B, L, L)
-        e_pair  = e_pair.masked_fill(~phys_mask, 1e9)
+        e_pair  = e_pair.masked_fill(~phys_mask, 3e4)  # fp16-safe forbidden sentinel
 
         # Decode optimal structure (non-differentiable argmin)
         pred_pairs = self.decoder(e_pair, e_unp, phys_mask)            # (B, L)
